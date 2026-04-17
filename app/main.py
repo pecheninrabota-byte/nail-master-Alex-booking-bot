@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.services import SERVICES, FAQ, get_service
-from app.calendar import generate_slots
+from app.calendar import generate_slots, create_event, delete_event, update_event
 from app.config import BUFFER_MINUTES
 from app.db import Base, engine
 from app.logic import (
@@ -28,8 +28,10 @@ from app.storage import (
     reschedule_booking,
     find_booking_by_id,
 )
+from app.telegram import send_telegram_message
 
 app = FastAPI(title="Nail Master Booking Bot")
+
 if engine is not None:
     Base.metadata.create_all(bind=engine)
 
@@ -42,6 +44,7 @@ app.add_middleware(
 )
 
 
+# ===== ROOT =====
 @app.get("/")
 def root():
     return {
@@ -50,6 +53,7 @@ def root():
     }
 
 
+# ===== SERVICES =====
 @app.get("/services")
 def get_services():
     return SERVICES
@@ -60,6 +64,7 @@ def get_faq():
     return FAQ
 
 
+# ===== SLOTS =====
 @app.get("/slots")
 def get_slots(service_id: str, date: str):
     service = get_service(service_id)
@@ -67,8 +72,6 @@ def get_slots(service_id: str, date: str):
     if not service:
         raise HTTPException(status_code=404, detail="Service not found")
 
-    # Пока календарь ещё не интегрирован, generate_slots просто отдаёт доступные интервалы
-    # по рабочему дню. Но уже учитываем буфер в 30 минут через duration.
     slots = generate_slots(date, service["duration"])
 
     return {
@@ -82,6 +85,7 @@ def get_slots(service_id: str, date: str):
     }
 
 
+# ===== SERVICE RECOMMENDATION =====
 @app.post("/service-recommendation", response_model=ServiceRecommendationResponse)
 def service_recommendation(data: ServiceRecommendationRequest):
     recommended_services, explanation = recommend_services(
@@ -90,15 +94,13 @@ def service_recommendation(data: ServiceRecommendationRequest):
         coating_type=data.coating_type,
     )
 
-    recommended_ids = [service["id"] for service in recommended_services]
-
-    # Пока клиента нет, lead фиксируем позже, когда появятся имя и контакт.
     return {
         "recommended_services": recommended_services,
         "explanation": explanation,
     }
 
 
+# ===== CONTACT REQUEST =====
 @app.post("/contact-request")
 def create_contact_request(data: ContactRequestCreate):
     client = create_client(
@@ -114,6 +116,10 @@ def create_contact_request(data: ContactRequestCreate):
         comment=data.comment,
     )
 
+    send_telegram_message(
+        f"Новая заявка на связь:\n{data.name}\n{data.contact}"
+    )
+
     return {
         "status": "success",
         "message": "Спасибо! Александр свяжется с вами в течение суток удобным для вас способом.",
@@ -122,6 +128,7 @@ def create_contact_request(data: ContactRequestCreate):
     }
 
 
+# ===== BOOKING =====
 @app.post("/booking-lead")
 def create_booking_lead(data: BookingLeadCreate):
     service = get_service(data.service_id)
@@ -135,6 +142,7 @@ def create_booking_lead(data: BookingLeadCreate):
         preferred_contact_method=None,
     )
 
+    # лид: начало записи
     lead = create_lead(
         client_id=client["id"],
         lead_type="booking_started",
@@ -145,6 +153,16 @@ def create_booking_lead(data: BookingLeadCreate):
         preferred_time=data.preferred_time,
     )
 
+    # 🔥 создаём событие в календаре
+    event_id = create_event(
+        data.name,
+        service["name"],
+        data.preferred_date,
+        data.preferred_time,
+        service["duration"],
+    )
+
+    # создаём booking
     booking = create_booking(
         client_id=client["id"],
         service_id=data.service_id,
@@ -153,8 +171,10 @@ def create_booking_lead(data: BookingLeadCreate):
         duration_minutes=service["duration"],
         buffer_minutes=BUFFER_MINUTES,
         comment=data.comment,
+        google_calendar_event_id=event_id,
     )
 
+    # лид: подтверждение
     create_lead(
         client_id=client["id"],
         lead_type="booking_confirmed",
@@ -163,6 +183,15 @@ def create_booking_lead(data: BookingLeadCreate):
         service_id=data.service_id,
         preferred_date=data.preferred_date,
         preferred_time=data.preferred_time,
+    )
+
+    # Telegram
+    send_telegram_message(
+        f"Новая запись:\n"
+        f"{data.name}\n"
+        f"{data.contact}\n"
+        f"{service['name']}\n"
+        f"{data.preferred_date} {data.preferred_time}"
     )
 
     return {
@@ -183,6 +212,7 @@ def create_booking_lead(data: BookingLeadCreate):
     }
 
 
+# ===== FIND BOOKING =====
 @app.post("/find-booking")
 def find_booking(data: FindBookingRequest):
     booking = find_active_booking_by_name_and_contact(
@@ -209,6 +239,7 @@ def find_booking(data: FindBookingRequest):
     }
 
 
+# ===== CANCEL =====
 @app.post("/cancel-booking")
 def api_cancel_booking(data: CancelBookingRequest):
     booking = find_booking_by_id(data.booking_id)
@@ -224,6 +255,9 @@ def api_cancel_booking(data: CancelBookingRequest):
     if not updated:
         raise HTTPException(status_code=400, detail="Unable to cancel booking")
 
+    # 🔥 удаляем из календаря
+    delete_event(booking.get("google_calendar_event_id"))
+
     create_lead(
         client_id=updated["client_id"],
         lead_type="cancellation",
@@ -234,6 +268,8 @@ def api_cancel_booking(data: CancelBookingRequest):
         cancel_reason=data.reason,
     )
 
+    send_telegram_message(f"Отмена записи: {data.booking_id}")
+
     return {
         "status": "success",
         "message": "Запись отменена. Буду рад помочь с новой записью позже.",
@@ -242,6 +278,7 @@ def api_cancel_booking(data: CancelBookingRequest):
     }
 
 
+# ===== RESCHEDULE =====
 @app.post("/reschedule-booking")
 def api_reschedule_booking(data: RescheduleBookingRequest):
     booking = find_booking_by_id(data.booking_id)
@@ -258,6 +295,16 @@ def api_reschedule_booking(data: RescheduleBookingRequest):
     if not updated:
         raise HTTPException(status_code=400, detail="Unable to reschedule booking")
 
+    service = get_service(updated["service_id"])
+
+    # 🔥 обновляем в календаре
+    update_event(
+        booking.get("google_calendar_event_id"),
+        data.new_date,
+        data.new_time,
+        service["duration"],
+    )
+
     create_lead(
         client_id=updated["client_id"],
         lead_type="reschedule_request",
@@ -267,7 +314,7 @@ def api_reschedule_booking(data: RescheduleBookingRequest):
         preferred_time=updated["time"],
     )
 
-    service = get_service(updated["service_id"])
+    send_telegram_message(f"Перенос записи: {data.booking_id}")
 
     return {
         "status": "success",
