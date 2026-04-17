@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.services import SERVICES, FAQ, get_service
 from app.calendar import generate_slots
 from app.config import BUFFER_MINUTES
+from app.db import Base, engine
 from app.logic import (
     recommend_services,
     build_booking_success_message,
@@ -29,6 +30,7 @@ from app.storage import (
 )
 
 app = FastAPI(title="Nail Master Booking Bot")
+Base.metadata.create_all(bind=engine)
 
 app.add_middleware(
     CORSMiddleware,
