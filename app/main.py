@@ -23,7 +23,7 @@ from app.storage import (
     get_or_create_client,
     create_lead,
     create_booking,
-    find_active_booking_by_name_and_contact,
+    find_booking,
     cancel_booking,
     reschedule_booking,
     find_booking_by_id,
@@ -44,7 +44,6 @@ app.add_middleware(
 )
 
 
-# ===== ROOT =====
 @app.get("/")
 def root():
     return {
@@ -53,7 +52,6 @@ def root():
     }
 
 
-# ===== SERVICES =====
 @app.get("/services")
 def get_services():
     return SERVICES
@@ -64,7 +62,6 @@ def get_faq():
     return FAQ
 
 
-# ===== SLOTS =====
 @app.get("/slots")
 def get_slots(service_id: str, date: str):
     service = get_service(service_id)
@@ -85,7 +82,6 @@ def get_slots(service_id: str, date: str):
     }
 
 
-# ===== SERVICE RECOMMENDATION =====
 @app.post("/service-recommendation", response_model=ServiceRecommendationResponse)
 def service_recommendation(data: ServiceRecommendationRequest):
     recommended_services, explanation = recommend_services(
@@ -94,41 +90,45 @@ def service_recommendation(data: ServiceRecommendationRequest):
         coating_type=data.coating_type,
     )
 
+    recommended_ids = [service["id"] for service in recommended_services]
+
     return {
         "recommended_services": recommended_services,
         "explanation": explanation,
+        "recommended_ids": recommended_ids,
     }
 
 
-# ===== CONTACT REQUEST =====
 @app.post("/contact-request")
 def create_contact_request(data: ContactRequestCreate):
-    client = create_client(
+    client = get_or_create_client(
         name=data.name,
         contact=data.contact,
-        preferred_contact_method=data.preferred_contact_method,
     )
 
     lead = create_lead(
-        client_id=client["id"],
+        client_id=client.id,
         lead_type="contact_request",
         status="contact_request",
         comment=data.comment,
     )
 
     send_telegram_message(
-        f"Новая заявка на связь:\n{data.name}\n{data.contact}"
+        f"Новая заявка на связь:\n"
+        f"Имя: {data.name}\n"
+        f"Контакт: {data.contact}\n"
+        f"Способ связи: {data.preferred_contact_method}\n"
+        f"Комментарий: {data.comment or '—'}"
     )
 
     return {
         "status": "success",
         "message": "Спасибо! Александр свяжется с вами в течение суток удобным для вас способом.",
-        "client_id": client["id"],
-        "lead_id": lead["id"],
+        "client_id": client.id,
+        "lead_id": lead.id if lead else None,
     }
 
 
-# ===== BOOKING =====
 @app.post("/booking-lead")
 def create_booking_lead(data: BookingLeadCreate):
     service = get_service(data.service_id)
@@ -136,15 +136,13 @@ def create_booking_lead(data: BookingLeadCreate):
     if not service:
         raise HTTPException(status_code=404, detail="Service not found")
 
-    client = create_client(
+    client = get_or_create_client(
         name=data.name,
         contact=data.contact,
-        preferred_contact_method=None,
     )
 
-    # лид: начало записи
     lead = create_lead(
-        client_id=client["id"],
+        client_id=client.id,
         lead_type="booking_started",
         status="booking_started",
         comment=data.comment,
@@ -153,7 +151,6 @@ def create_booking_lead(data: BookingLeadCreate):
         preferred_time=data.preferred_time,
     )
 
-    # 🔥 создаём событие в календаре
     event_id = create_event(
         data.name,
         service["name"],
@@ -162,21 +159,16 @@ def create_booking_lead(data: BookingLeadCreate):
         service["duration"],
     )
 
-    # создаём booking
     booking = create_booking(
-        client_id=client["id"],
-        service_id=data.service_id,
-        date=data.preferred_date,
-        time=data.preferred_time,
-        duration_minutes=service["duration"],
+        client_id=client.id,
+        data=data,
+        duration=service["duration"],
         buffer_minutes=BUFFER_MINUTES,
-        comment=data.comment,
-        google_calendar_event_id=event_id,
+        event_id=event_id,
     )
 
-    # лид: подтверждение
     create_lead(
-        client_id=client["id"],
+        client_id=client.id,
         lead_type="booking_confirmed",
         status="booking_confirmed",
         comment=data.comment,
@@ -185,37 +177,38 @@ def create_booking_lead(data: BookingLeadCreate):
         preferred_time=data.preferred_time,
     )
 
-    # Telegram
     send_telegram_message(
         f"Новая запись:\n"
-        f"{data.name}\n"
-        f"{data.contact}\n"
-        f"{service['name']}\n"
-        f"{data.preferred_date} {data.preferred_time}"
+        f"Имя: {data.name}\n"
+        f"Контакт: {data.contact}\n"
+        f"Услуга: {service['name']}\n"
+        f"Дата: {data.preferred_date}\n"
+        f"Время: {data.preferred_time}\n"
+        f"Комментарий: {data.comment or '—'}"
     )
 
     return {
         "status": "success",
         "message": build_booking_success_message(),
         "booking": {
-            "booking_id": booking["id"],
+            "booking_id": booking.id,
             "service": service["name"],
-            "date": booking["date"],
-            "time": booking["time"],
-            "duration_minutes": booking["duration_minutes"],
-            "buffer_minutes": booking["buffer_minutes"],
-            "client_name": client["name"],
-            "contact": client["contact"],
-            "comment": booking["comment"],
+            "date": booking.date,
+            "time": booking.time,
+            "duration_minutes": booking.duration_minutes,
+            "buffer_minutes": booking.buffer_minutes,
+            "client_name": client.name,
+            "contact": client.contact,
+            "comment": booking.comment,
+            "google_calendar_event_id": booking.google_calendar_event_id,
         },
-        "lead_id": lead["id"],
+        "lead_id": lead.id if lead else None,
     }
 
 
-# ===== FIND BOOKING =====
 @app.post("/find-booking")
-def find_booking(data: FindBookingRequest):
-    booking = find_active_booking_by_name_and_contact(
+def api_find_booking(data: FindBookingRequest):
+    booking = find_booking(
         name=data.name,
         contact=data.contact,
     )
@@ -223,23 +216,23 @@ def find_booking(data: FindBookingRequest):
     if not booking:
         raise HTTPException(status_code=404, detail="Active booking not found")
 
-    service = get_service(booking["service_id"])
+    service = get_service(booking.service_id)
 
     return {
         "status": "success",
         "booking": {
-            "booking_id": booking["id"],
-            "service_id": booking["service_id"],
-            "service_name": service["name"] if service else booking["service_id"],
-            "date": booking["date"],
-            "time": booking["time"],
-            "status": booking["status"],
-            "comment": booking.get("comment"),
+            "booking_id": booking.id,
+            "service_id": booking.service_id,
+            "service_name": service["name"] if service else booking.service_id,
+            "date": booking.date,
+            "time": booking.time,
+            "status": booking.status,
+            "comment": booking.comment,
+            "google_calendar_event_id": booking.google_calendar_event_id,
         },
     }
 
 
-# ===== CANCEL =====
 @app.post("/cancel-booking")
 def api_cancel_booking(data: CancelBookingRequest):
     booking = find_booking_by_id(data.booking_id)
@@ -255,30 +248,35 @@ def api_cancel_booking(data: CancelBookingRequest):
     if not updated:
         raise HTTPException(status_code=400, detail="Unable to cancel booking")
 
-    # 🔥 удаляем из календаря
-    delete_event(booking.get("google_calendar_event_id"))
+    delete_event(booking.google_calendar_event_id)
 
     create_lead(
-        client_id=updated["client_id"],
+        client_id=updated.client_id,
         lead_type="cancellation",
         status="cancellation",
-        service_id=updated["service_id"],
-        preferred_date=updated["date"],
-        preferred_time=updated["time"],
+        service_id=updated.service_id,
+        preferred_date=updated.date,
+        preferred_time=updated.time,
         cancel_reason=data.reason,
     )
 
-    send_telegram_message(f"Отмена записи: {data.booking_id}")
+    send_telegram_message(
+        f"Отмена записи:\n"
+        f"Booking ID: {updated.id}\n"
+        f"Услуга: {updated.service_id}\n"
+        f"Дата: {updated.date}\n"
+        f"Время: {updated.time}\n"
+        f"Причина: {data.reason or 'не указана'}"
+    )
 
     return {
         "status": "success",
         "message": "Запись отменена. Буду рад помочь с новой записью позже.",
-        "booking_id": updated["id"],
+        "booking_id": updated.id,
         "cancel_reason": data.reason,
     }
 
 
-# ===== RESCHEDULE =====
 @app.post("/reschedule-booking")
 def api_reschedule_booking(data: RescheduleBookingRequest):
     booking = find_booking_by_id(data.booking_id)
@@ -295,36 +293,42 @@ def api_reschedule_booking(data: RescheduleBookingRequest):
     if not updated:
         raise HTTPException(status_code=400, detail="Unable to reschedule booking")
 
-    service = get_service(updated["service_id"])
+    service = get_service(updated.service_id)
 
-    # 🔥 обновляем в календаре
     update_event(
-        booking.get("google_calendar_event_id"),
+        booking.google_calendar_event_id,
         data.new_date,
         data.new_time,
         service["duration"],
     )
 
     create_lead(
-        client_id=updated["client_id"],
+        client_id=updated.client_id,
         lead_type="reschedule_request",
         status="reschedule_request",
-        service_id=updated["service_id"],
-        preferred_date=updated["date"],
-        preferred_time=updated["time"],
+        service_id=updated.service_id,
+        preferred_date=updated.date,
+        preferred_time=updated.time,
     )
 
-    send_telegram_message(f"Перенос записи: {data.booking_id}")
+    send_telegram_message(
+        f"Перенос записи:\n"
+        f"Booking ID: {updated.id}\n"
+        f"Услуга: {service['name'] if service else updated.service_id}\n"
+        f"Новая дата: {updated.date}\n"
+        f"Новое время: {updated.time}"
+    )
 
     return {
         "status": "success",
         "message": "Запись успешно перенесена.",
         "booking": {
-            "booking_id": updated["id"],
-            "service_id": updated["service_id"],
-            "service_name": service["name"] if service else updated["service_id"],
-            "date": updated["date"],
-            "time": updated["time"],
-            "status": updated["status"],
+            "booking_id": updated.id,
+            "service_id": updated.service_id,
+            "service_name": service["name"] if service else updated.service_id,
+            "date": updated.date,
+            "time": updated.time,
+            "status": updated.status,
+            "google_calendar_event_id": updated.google_calendar_event_id,
         },
     }
