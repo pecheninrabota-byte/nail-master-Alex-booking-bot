@@ -30,7 +30,8 @@ from app.storage import (
 )
 
 app = FastAPI(title="Nail Master Booking Bot")
-Base.metadata.create_all(bind=engine)
+if engine is not None:
+    Base.metadata.create_all(bind=engine)
 
 app.add_middleware(
     CORSMiddleware,
