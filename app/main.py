@@ -20,7 +20,7 @@ from app.schemas import (
     RescheduleBookingRequest,
 )
 from app.storage import (
-    create_client,
+    get_or_create_client,
     create_lead,
     create_booking,
     find_active_booking_by_name_and_contact,
