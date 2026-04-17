@@ -15,7 +15,7 @@ class Client(Base):
 
     id = Column(String, primary_key=True, default=gen_id)
     name = Column(String, nullable=False)
-    contact = Column(String, nullable=False, index=True, unique=False)
+    contact = Column(String, nullable=False, index=True)
     preferred_contact_method = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -37,6 +37,8 @@ class Booking(Base):
 
     status = Column(String, default="confirmed", nullable=False)
     comment = Column(Text, nullable=True)
+
+    # 🔥 связь с Google Calendar
     google_calendar_event_id = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -49,7 +51,7 @@ class Lead(Base):
     id = Column(String, primary_key=True, default=gen_id)
     client_id = Column(String, ForeignKey("clients.id"), nullable=False, index=True)
 
-    lead_type = Column(String, nullable=False)
+    lead_type = Column(String, nullable=False)  # booking / contact / recommendation
     status = Column(String, nullable=False)
 
     service_id = Column(String, nullable=True)
@@ -58,6 +60,7 @@ class Lead(Base):
 
     comment = Column(Text, nullable=True)
     cancel_reason = Column(Text, nullable=True)
+
     source = Column(String, default="website_bot", nullable=False)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
