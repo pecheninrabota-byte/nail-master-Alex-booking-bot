@@ -6,6 +6,7 @@ CategoryType = Literal["manicure", "pedicure", "combo"]
 YesNoType = Literal["yes", "no"]
 CoatingType = Literal["none", "lacquer", "gel", "films"]
 ContactMethodType = Literal["telegram", "phone"]
+
 LeadStatusType = Literal[
     "booking_started",
     "booking_confirmed",
@@ -14,7 +15,9 @@ LeadStatusType = Literal[
     "reschedule_request",
     "cancellation",
 ]
+
 BookingStatusType = Literal["confirmed", "cancelled", "rescheduled"]
+ClientStatusType = Literal["new", "returned", "regular", "left", "claim", "blacklist"]
 
 
 class ServiceRecommendationRequest(BaseModel):
@@ -26,6 +29,7 @@ class ServiceRecommendationRequest(BaseModel):
 class ServiceRecommendationResponse(BaseModel):
     recommended_services: list[dict]
     explanation: str
+    recommended_ids: list[str]
 
 
 class ContactRequestCreate(BaseModel):
@@ -38,6 +42,7 @@ class ContactRequestCreate(BaseModel):
 class BookingLeadCreate(BaseModel):
     name: str = Field(..., description="Имя и фамилия или псевдоним")
     contact: str = Field(..., description="Телефон или Telegram username")
+    preferred_contact_method: Optional[ContactMethodType] = Field(default=None, description="telegram / phone")
     service_id: str = Field(..., description="ID услуги")
     preferred_date: str = Field(..., description="Дата YYYY-MM-DD")
     preferred_time: str = Field(..., description="Время HH:MM")
