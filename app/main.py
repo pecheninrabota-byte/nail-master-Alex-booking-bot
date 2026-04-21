@@ -1,17 +1,17 @@
 import logging
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.services import SERVICES, FAQ, get_service
 from app.calendar import generate_slots, create_event, delete_event, update_event
 from app.config import BUFFER_MINUTES
-from app.db import Base, engine, SessionLocal
+from app.db import Base, engine
 from app.logic import (
     recommend_services,
     build_booking_success_message,
     get_total_duration_with_buffer,
 )
-from app.models import Client
 from app.schemas import (
     ServiceRecommendationRequest,
     ServiceRecommendationResponse,
@@ -25,10 +25,12 @@ from app.storage import (
     get_or_create_client,
     create_lead,
     create_booking,
-    find_booking,
+    find_booking_by_id,
     cancel_booking,
     reschedule_booking,
-    find_booking_by_id,
+    get_client_by_id,
+    get_client_active_bookings,
+    is_client_blacklisted,
 )
 from app.telegram import (
     send_telegram_message,
@@ -52,17 +54,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-def get_client_by_id(client_id: str):
-    if SessionLocal is None:
-        return None
-
-    db = SessionLocal()
-    try:
-        return db.query(Client).filter(Client.id == client_id).first()
-    finally:
-        db.close()
 
 
 def ensure_slot_is_available(service_id: str, date: str, slot_time: str):
@@ -180,6 +171,12 @@ def create_booking_lead(data: BookingLeadCreate):
         slot_time=data.preferred_time,
     )
 
+    if is_client_blacklisted(data.contact):
+        raise HTTPException(
+            status_code=403,
+            detail="Booking is not available for this client. Please contact the master directly.",
+        )
+
     preferred_contact_method = getattr(data, "preferred_contact_method", None)
 
     client = get_or_create_client(
@@ -216,6 +213,8 @@ def create_booking_lead(data: BookingLeadCreate):
         duration=service["duration"],
         buffer_minutes=BUFFER_MINUTES,
         event_id=event_id,
+        service=service,
+        client=client,
     )
 
     create_lead(
@@ -247,15 +246,18 @@ def create_booking_lead(data: BookingLeadCreate):
         "message": build_booking_success_message(),
         "booking": {
             "booking_id": booking.id,
-            "service": service["name"],
+            "service": booking.service_name or service["name"],
+            "service_id": booking.service_id,
+            "price": booking.price,
             "date": booking.date,
             "time": booking.time,
             "duration_minutes": booking.duration_minutes,
             "buffer_minutes": booking.buffer_minutes,
-            "client_name": client.name,
-            "contact": client.contact,
-            "preferred_contact_method": getattr(client, "preferred_contact_method", None),
+            "client_name": booking.client_name or client.name,
+            "contact": booking.client_contact or client.contact,
+            "preferred_contact_method": booking.preferred_contact_method or getattr(client, "preferred_contact_method", None),
             "comment": booking.comment,
+            "client_status_snapshot": booking.client_status_snapshot,
             "google_calendar_event_id": booking.google_calendar_event_id,
         },
         "lead_id": lead.id if lead else None,
@@ -264,32 +266,38 @@ def create_booking_lead(data: BookingLeadCreate):
 
 @app.post("/find-booking")
 def api_find_booking(data: FindBookingRequest):
-    booking = find_booking(
+    bookings = get_client_active_bookings(
         name=data.name,
         contact=data.contact,
     )
 
-    if not booking:
-        raise HTTPException(status_code=404, detail="Active booking not found")
+    if not bookings:
+        raise HTTPException(status_code=404, detail="Active bookings not found")
 
-    service = get_service(booking.service_id)
-    client = get_client_by_id(booking.client_id)
+    result = []
+    for booking in bookings:
+        service = get_service(booking.service_id)
 
-    return {
-        "status": "success",
-        "booking": {
+        result.append({
             "booking_id": booking.id,
             "service_id": booking.service_id,
-            "service_name": service["name"] if service else booking.service_id,
+            "service_name": booking.service_name or (service["name"] if service else booking.service_id),
+            "price": booking.price,
             "date": booking.date,
             "time": booking.time,
             "status": booking.status,
             "comment": booking.comment,
-            "contact": client.contact if client else None,
-            "client_name": client.name if client else None,
-            "preferred_contact_method": getattr(client, "preferred_contact_method", None) if client else None,
+            "contact": booking.client_contact,
+            "client_name": booking.client_name,
+            "preferred_contact_method": booking.preferred_contact_method,
             "google_calendar_event_id": booking.google_calendar_event_id,
-        },
+            "client_status_snapshot": booking.client_status_snapshot,
+        })
+
+    return {
+        "status": "success",
+        "bookings": result,
+        "count": len(result),
     }
 
 
@@ -328,12 +336,16 @@ def api_cancel_booking(data: CancelBookingRequest):
 
     telegram_result = send_telegram_message(
         format_booking_cancelled_message(
-            client_name=client.name if client else "Неизвестный клиент",
-            contact=client.contact if client else "—",
-            service_name=service["name"] if service else updated.service_id,
+            client_name=client.name if client else (updated.client_name or "Неизвестный клиент"),
+            contact=client.contact if client else (updated.client_contact or "—"),
+            service_name=updated.service_name or (service["name"] if service else updated.service_id),
             date=updated.date,
             time=updated.time,
-            preferred_contact_method=getattr(client, "preferred_contact_method", None) if client else None,
+            preferred_contact_method=(
+                getattr(client, "preferred_contact_method", None)
+                if client
+                else updated.preferred_contact_method
+            ),
             cancel_reason=data.reason,
         )
     )
@@ -385,10 +397,14 @@ def api_reschedule_booking(data: RescheduleBookingRequest):
             date=data.new_date,
             time=data.new_time,
             duration=service["duration"],
-            name=client.name if client else None,
-            contact=client.contact if client else None,
-            service_name=service["name"],
-            preferred_contact_method=getattr(client, "preferred_contact_method", None) if client else None,
+            name=client.name if client else updated.client_name,
+            contact=client.contact if client else updated.client_contact,
+            service_name=updated.service_name or service["name"],
+            preferred_contact_method=(
+                getattr(client, "preferred_contact_method", None)
+                if client
+                else updated.preferred_contact_method
+            ),
             comment=updated.comment,
             action_label="Перенос записи",
         )
@@ -406,14 +422,18 @@ def api_reschedule_booking(data: RescheduleBookingRequest):
 
     telegram_result = send_telegram_message(
         format_booking_rescheduled_message(
-            client_name=client.name if client else "Неизвестный клиент",
-            contact=client.contact if client else "—",
-            service_name=service["name"],
+            client_name=client.name if client else (updated.client_name or "Неизвестный клиент"),
+            contact=client.contact if client else (updated.client_contact or "—"),
+            service_name=updated.service_name or service["name"],
             old_date=old_date,
             old_time=old_time,
             new_date=updated.date,
             new_time=updated.time,
-            preferred_contact_method=getattr(client, "preferred_contact_method", None) if client else None,
+            preferred_contact_method=(
+                getattr(client, "preferred_contact_method", None)
+                if client
+                else updated.preferred_contact_method
+            ),
             comment=updated.comment,
         )
     )
@@ -425,14 +445,18 @@ def api_reschedule_booking(data: RescheduleBookingRequest):
         "booking": {
             "booking_id": updated.id,
             "service_id": updated.service_id,
-            "service_name": service["name"],
+            "service_name": updated.service_name or service["name"],
+            "price": updated.price,
             "date": updated.date,
             "time": updated.time,
             "status": updated.status,
             "comment": updated.comment,
-            "contact": client.contact if client else None,
-            "client_name": client.name if client else None,
-            "preferred_contact_method": getattr(client, "preferred_contact_method", None) if client else None,
+            "contact": updated.client_contact or (client.contact if client else None),
+            "client_name": updated.client_name or (client.name if client else None),
+            "preferred_contact_method": updated.preferred_contact_method or (
+                getattr(client, "preferred_contact_method", None) if client else None
+            ),
+            "client_status_snapshot": updated.client_status_snapshot,
             "google_calendar_event_id": updated.google_calendar_event_id,
         },
     }
