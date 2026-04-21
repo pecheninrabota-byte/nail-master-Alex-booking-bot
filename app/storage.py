@@ -1,36 +1,43 @@
 from datetime import datetime
 
 from app.db import SessionLocal
-from app import models
+from app.models import Client, Lead, Booking
 
 
 def get_db():
     if SessionLocal is None:
-        return None
-    return SessionLocal()
+        raise RuntimeError("DATABASE_URL is not configured")
 
-
-# ===== CLIENT =====
-def get_or_create_client(name: str, contact: str):
-    db = get_db()
-    if not db:
-        return None
-
+    db = SessionLocal()
     try:
-        client = db.query(models.Client).filter(
-            models.Client.contact == contact
-        ).first()
+        yield db
+    finally:
+        db.close()
+
+
+def get_or_create_client(name: str, contact: str, preferred_contact_method: str | None = None):
+    if SessionLocal is None:
+        raise RuntimeError("DATABASE_URL is not configured")
+
+    db = SessionLocal()
+    try:
+        client = db.query(Client).filter(Client.contact == contact).first()
 
         if client:
             client.name = name
+            if preferred_contact_method is not None:
+                client.preferred_contact_method = preferred_contact_method
             client.updated_at = datetime.utcnow()
             db.commit()
             db.refresh(client)
             return client
 
-        client = models.Client(
+        client = Client(
             name=name,
             contact=contact,
+            preferred_contact_method=preferred_contact_method,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
         )
         db.add(client)
         db.commit()
@@ -40,24 +47,22 @@ def get_or_create_client(name: str, contact: str):
         db.close()
 
 
-# ===== LEAD =====
 def create_lead(
     client_id: str,
     lead_type: str,
     status: str,
-    service_id: str = None,
-    preferred_date: str = None,
-    preferred_time: str = None,
-    comment: str = None,
-    cancel_reason: str = None,
-    source: str = "website_bot",
+    comment: str | None = None,
+    service_id: str | None = None,
+    preferred_date: str | None = None,
+    preferred_time: str | None = None,
+    cancel_reason: str | None = None,
 ):
-    db = get_db()
-    if not db:
-        return None
+    if SessionLocal is None:
+        raise RuntimeError("DATABASE_URL is not configured")
 
+    db = SessionLocal()
     try:
-        lead = models.Lead(
+        lead = Lead(
             client_id=client_id,
             lead_type=lead_type,
             status=status,
@@ -66,7 +71,7 @@ def create_lead(
             preferred_time=preferred_time,
             comment=comment,
             cancel_reason=cancel_reason,
-            source=source,
+            created_at=datetime.utcnow(),
         )
         db.add(lead)
         db.commit()
@@ -76,29 +81,23 @@ def create_lead(
         db.close()
 
 
-# ===== BOOKING =====
-def create_booking(
-    client_id: str,
-    data,
-    duration: int,
-    buffer_minutes: int,
-    event_id: str = None,
-):
-    db = get_db()
-    if not db:
-        return None
+def create_booking(client_id: str, data, duration: int, buffer_minutes: int, event_id: str | None = None):
+    if SessionLocal is None:
+        raise RuntimeError("DATABASE_URL is not configured")
 
+    db = SessionLocal()
     try:
-        booking = models.Booking(
+        booking = Booking(
             client_id=client_id,
             service_id=data.service_id,
             date=data.preferred_date,
             time=data.preferred_time,
             duration_minutes=duration,
             buffer_minutes=buffer_minutes,
-            comment=data.comment,
             status="confirmed",
+            comment=data.comment,
             google_calendar_event_id=event_id,
+            created_at=datetime.utcnow(),
             updated_at=datetime.utcnow(),
         )
         db.add(booking)
@@ -110,67 +109,59 @@ def create_booking(
 
 
 def find_booking(name: str, contact: str):
-    db = get_db()
-    if not db:
-        return None
+    if SessionLocal is None:
+        raise RuntimeError("DATABASE_URL is not configured")
 
+    db = SessionLocal()
     try:
-        booking = (
-            db.query(models.Booking)
-            .join(models.Client, models.Booking.client_id == models.Client.id)
-            .filter(
-                models.Client.name == name,
-                models.Client.contact == contact,
-                models.Booking.status.in_(["confirmed", "rescheduled"]),
-            )
-            .order_by(models.Booking.created_at.desc())
+        client = (
+            db.query(Client)
+            .filter(Client.name == name, Client.contact == contact)
             .first()
         )
+
+        if not client:
+            return None
+
+        booking = (
+            db.query(Booking)
+            .filter(
+                Booking.client_id == client.id,
+                Booking.status == "confirmed",
+            )
+            .order_by(Booking.created_at.desc())
+            .first()
+        )
+
         return booking
     finally:
         db.close()
 
 
 def find_booking_by_id(booking_id: str):
-    db = get_db()
-    if not db:
-        return None
+    if SessionLocal is None:
+        raise RuntimeError("DATABASE_URL is not configured")
 
+    db = SessionLocal()
     try:
-        booking = (
-            db.query(models.Booking)
-            .filter(models.Booking.id == booking_id)
-            .first()
-        )
-        return booking
+        return db.query(Booking).filter(Booking.id == booking_id).first()
     finally:
         db.close()
 
 
-def cancel_booking(booking_id: str, reason: str = None):
-    db = get_db()
-    if not db:
-        return None
+def cancel_booking(booking_id: str, reason: str | None = None):
+    if SessionLocal is None:
+        raise RuntimeError("DATABASE_URL is not configured")
 
+    db = SessionLocal()
     try:
-        booking = (
-            db.query(models.Booking)
-            .filter(models.Booking.id == booking_id)
-            .first()
-        )
+        booking = db.query(Booking).filter(Booking.id == booking_id).first()
 
         if not booking:
             return None
 
         booking.status = "cancelled"
         booking.updated_at = datetime.utcnow()
-
-        if reason:
-            if booking.comment:
-                booking.comment = f"{booking.comment}\nПричина отмены: {reason}"
-            else:
-                booking.comment = f"Причина отмены: {reason}"
-
         db.commit()
         db.refresh(booking)
         return booking
@@ -179,25 +170,19 @@ def cancel_booking(booking_id: str, reason: str = None):
 
 
 def reschedule_booking(booking_id: str, new_date: str, new_time: str):
-    db = get_db()
-    if not db:
-        return None
+    if SessionLocal is None:
+        raise RuntimeError("DATABASE_URL is not configured")
 
+    db = SessionLocal()
     try:
-        booking = (
-            db.query(models.Booking)
-            .filter(models.Booking.id == booking_id)
-            .first()
-        )
+        booking = db.query(Booking).filter(Booking.id == booking_id).first()
 
         if not booking:
             return None
 
         booking.date = new_date
         booking.time = new_time
-        booking.status = "rescheduled"
         booking.updated_at = datetime.utcnow()
-
         db.commit()
         db.refresh(booking)
         return booking
