@@ -1,15 +1,17 @@
+import logging
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.services import SERVICES, FAQ, get_service
 from app.calendar import generate_slots, create_event, delete_event, update_event
 from app.config import BUFFER_MINUTES
-from app.db import Base, engine
+from app.db import Base, engine, SessionLocal
 from app.logic import (
     recommend_services,
     build_booking_success_message,
     get_total_duration_with_buffer,
 )
+from app.models import Client
 from app.schemas import (
     ServiceRecommendationRequest,
     ServiceRecommendationResponse,
@@ -28,7 +30,15 @@ from app.storage import (
     reschedule_booking,
     find_booking_by_id,
 )
-from app.telegram import send_telegram_message
+from app.telegram import (
+    send_telegram_message,
+    format_booking_created_message,
+    format_booking_cancelled_message,
+    format_booking_rescheduled_message,
+    format_contact_request_message,
+)
+
+logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="Nail Master Booking Bot")
 
@@ -42,6 +52,34 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def get_client_by_id(client_id: str):
+    if SessionLocal is None:
+        return None
+
+    db = SessionLocal()
+    try:
+        return db.query(Client).filter(Client.id == client_id).first()
+    finally:
+        db.close()
+
+
+def ensure_slot_is_available(service_id: str, date: str, slot_time: str):
+    service = get_service(service_id)
+
+    if not service:
+        raise HTTPException(status_code=404, detail="Service not found")
+
+    available_slots = generate_slots(date, service["duration"])
+
+    if slot_time not in available_slots:
+        raise HTTPException(
+            status_code=409,
+            detail="Selected time is no longer available. Please choose another slot.",
+        )
+
+    return service, available_slots
 
 
 @app.get("/")
@@ -101,9 +139,12 @@ def service_recommendation(data: ServiceRecommendationRequest):
 
 @app.post("/contact-request")
 def create_contact_request(data: ContactRequestCreate):
+    preferred_contact_method = getattr(data, "preferred_contact_method", None)
+
     client = get_or_create_client(
         name=data.name,
         contact=data.contact,
+        preferred_contact_method=preferred_contact_method,
     )
 
     lead = create_lead(
@@ -113,13 +154,15 @@ def create_contact_request(data: ContactRequestCreate):
         comment=data.comment,
     )
 
-    send_telegram_message(
-        f"Новая заявка на связь:\n"
-        f"Имя: {data.name}\n"
-        f"Контакт: {data.contact}\n"
-        f"Способ связи: {data.preferred_contact_method}\n"
-        f"Комментарий: {data.comment or '—'}"
+    telegram_result = send_telegram_message(
+        format_contact_request_message(
+            client_name=data.name,
+            contact=data.contact,
+            preferred_contact_method=preferred_contact_method,
+            comment=data.comment,
+        )
     )
+    logger.info("Contact request telegram result: %s", telegram_result)
 
     return {
         "status": "success",
@@ -131,14 +174,18 @@ def create_contact_request(data: ContactRequestCreate):
 
 @app.post("/booking-lead")
 def create_booking_lead(data: BookingLeadCreate):
-    service = get_service(data.service_id)
+    service, _ = ensure_slot_is_available(
+        service_id=data.service_id,
+        date=data.preferred_date,
+        slot_time=data.preferred_time,
+    )
 
-    if not service:
-        raise HTTPException(status_code=404, detail="Service not found")
+    preferred_contact_method = getattr(data, "preferred_contact_method", None)
 
     client = get_or_create_client(
         name=data.name,
         contact=data.contact,
+        preferred_contact_method=preferred_contact_method,
     )
 
     lead = create_lead(
@@ -152,11 +199,15 @@ def create_booking_lead(data: BookingLeadCreate):
     )
 
     event_id = create_event(
-        data.name,
-        service["name"],
-        data.preferred_date,
-        data.preferred_time,
-        service["duration"],
+        name=client.name,
+        contact=client.contact,
+        service_name=service["name"],
+        date=data.preferred_date,
+        time=data.preferred_time,
+        duration=service["duration"],
+        preferred_contact_method=getattr(client, "preferred_contact_method", None),
+        comment=data.comment,
+        action_label="Новая запись",
     )
 
     booking = create_booking(
@@ -177,15 +228,19 @@ def create_booking_lead(data: BookingLeadCreate):
         preferred_time=data.preferred_time,
     )
 
-    send_telegram_message(
-        f"Новая запись:\n"
-        f"Имя: {data.name}\n"
-        f"Контакт: {data.contact}\n"
-        f"Услуга: {service['name']}\n"
-        f"Дата: {data.preferred_date}\n"
-        f"Время: {data.preferred_time}\n"
-        f"Комментарий: {data.comment or '—'}"
+    telegram_result = send_telegram_message(
+        format_booking_created_message(
+            client_name=client.name,
+            contact=client.contact,
+            service_name=service["name"],
+            date=data.preferred_date,
+            time=data.preferred_time,
+            price=service.get("price"),
+            preferred_contact_method=getattr(client, "preferred_contact_method", None),
+            comment=data.comment,
+        )
     )
+    logger.info("Booking telegram result: %s", telegram_result)
 
     return {
         "status": "success",
@@ -199,6 +254,7 @@ def create_booking_lead(data: BookingLeadCreate):
             "buffer_minutes": booking.buffer_minutes,
             "client_name": client.name,
             "contact": client.contact,
+            "preferred_contact_method": getattr(client, "preferred_contact_method", None),
             "comment": booking.comment,
             "google_calendar_event_id": booking.google_calendar_event_id,
         },
@@ -217,6 +273,7 @@ def api_find_booking(data: FindBookingRequest):
         raise HTTPException(status_code=404, detail="Active booking not found")
 
     service = get_service(booking.service_id)
+    client = get_client_by_id(booking.client_id)
 
     return {
         "status": "success",
@@ -228,6 +285,9 @@ def api_find_booking(data: FindBookingRequest):
             "time": booking.time,
             "status": booking.status,
             "comment": booking.comment,
+            "contact": client.contact if client else None,
+            "client_name": client.name if client else None,
+            "preferred_contact_method": getattr(client, "preferred_contact_method", None) if client else None,
             "google_calendar_event_id": booking.google_calendar_event_id,
         },
     }
@@ -240,6 +300,9 @@ def api_cancel_booking(data: CancelBookingRequest):
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
 
+    client = get_client_by_id(booking.client_id)
+    service = get_service(booking.service_id)
+
     updated = cancel_booking(
         booking_id=data.booking_id,
         reason=data.reason,
@@ -248,7 +311,10 @@ def api_cancel_booking(data: CancelBookingRequest):
     if not updated:
         raise HTTPException(status_code=400, detail="Unable to cancel booking")
 
-    delete_event(booking.google_calendar_event_id)
+    try:
+        delete_event(booking.google_calendar_event_id)
+    except Exception:
+        logger.exception("Failed to delete Google Calendar event for booking_id=%s", booking.id)
 
     create_lead(
         client_id=updated.client_id,
@@ -260,14 +326,18 @@ def api_cancel_booking(data: CancelBookingRequest):
         cancel_reason=data.reason,
     )
 
-    send_telegram_message(
-        f"Отмена записи:\n"
-        f"Booking ID: {updated.id}\n"
-        f"Услуга: {updated.service_id}\n"
-        f"Дата: {updated.date}\n"
-        f"Время: {updated.time}\n"
-        f"Причина: {data.reason or 'не указана'}"
+    telegram_result = send_telegram_message(
+        format_booking_cancelled_message(
+            client_name=client.name if client else "Неизвестный клиент",
+            contact=client.contact if client else "—",
+            service_name=service["name"] if service else updated.service_id,
+            date=updated.date,
+            time=updated.time,
+            preferred_contact_method=getattr(client, "preferred_contact_method", None) if client else None,
+            cancel_reason=data.reason,
+        )
     )
+    logger.info("Cancel telegram result: %s", telegram_result)
 
     return {
         "status": "success",
@@ -284,6 +354,22 @@ def api_reschedule_booking(data: RescheduleBookingRequest):
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
 
+    service = get_service(booking.service_id)
+
+    if not service:
+        raise HTTPException(status_code=404, detail="Service not found")
+
+    ensure_slot_is_available(
+        service_id=booking.service_id,
+        date=data.new_date,
+        slot_time=data.new_time,
+    )
+
+    client = get_client_by_id(booking.client_id)
+
+    old_date = booking.date
+    old_time = booking.time
+
     updated = reschedule_booking(
         booking_id=data.booking_id,
         new_date=data.new_date,
@@ -293,14 +379,21 @@ def api_reschedule_booking(data: RescheduleBookingRequest):
     if not updated:
         raise HTTPException(status_code=400, detail="Unable to reschedule booking")
 
-    service = get_service(updated.service_id)
-
-    update_event(
-        booking.google_calendar_event_id,
-        data.new_date,
-        data.new_time,
-        service["duration"],
-    )
+    try:
+        update_event(
+            event_id=booking.google_calendar_event_id,
+            date=data.new_date,
+            time=data.new_time,
+            duration=service["duration"],
+            name=client.name if client else None,
+            contact=client.contact if client else None,
+            service_name=service["name"],
+            preferred_contact_method=getattr(client, "preferred_contact_method", None) if client else None,
+            comment=updated.comment,
+            action_label="Перенос записи",
+        )
+    except Exception:
+        logger.exception("Failed to update Google Calendar event for booking_id=%s", booking.id)
 
     create_lead(
         client_id=updated.client_id,
@@ -311,13 +404,20 @@ def api_reschedule_booking(data: RescheduleBookingRequest):
         preferred_time=updated.time,
     )
 
-    send_telegram_message(
-        f"Перенос записи:\n"
-        f"Booking ID: {updated.id}\n"
-        f"Услуга: {service['name'] if service else updated.service_id}\n"
-        f"Новая дата: {updated.date}\n"
-        f"Новое время: {updated.time}"
+    telegram_result = send_telegram_message(
+        format_booking_rescheduled_message(
+            client_name=client.name if client else "Неизвестный клиент",
+            contact=client.contact if client else "—",
+            service_name=service["name"],
+            old_date=old_date,
+            old_time=old_time,
+            new_date=updated.date,
+            new_time=updated.time,
+            preferred_contact_method=getattr(client, "preferred_contact_method", None) if client else None,
+            comment=updated.comment,
+        )
     )
+    logger.info("Reschedule telegram result: %s", telegram_result)
 
     return {
         "status": "success",
@@ -325,10 +425,14 @@ def api_reschedule_booking(data: RescheduleBookingRequest):
         "booking": {
             "booking_id": updated.id,
             "service_id": updated.service_id,
-            "service_name": service["name"] if service else updated.service_id,
+            "service_name": service["name"],
             "date": updated.date,
             "time": updated.time,
             "status": updated.status,
+            "comment": updated.comment,
+            "contact": client.contact if client else None,
+            "client_name": client.name if client else None,
+            "preferred_contact_method": getattr(client, "preferred_contact_method", None) if client else None,
             "google_calendar_event_id": updated.google_calendar_event_id,
         },
     }
