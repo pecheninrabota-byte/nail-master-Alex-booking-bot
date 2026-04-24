@@ -3,6 +3,9 @@ import logging
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
+from sqlalchemy import text
+from app.db import SessionLocal
+
 from app.services import SERVICES, FAQ, get_service
 from app.calendar import generate_slots, create_event, delete_event, update_event
 from app.config import BUFFER_MINUTES
@@ -460,3 +463,39 @@ def api_reschedule_booking(data: RescheduleBookingRequest):
             "google_calendar_event_id": updated.google_calendar_event_id,
         },
     }
+
+@app.get("/debug/migrate-db")
+def debug_migrate_db():
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail="DATABASE_URL is not configured")
+
+    sql_commands = [
+        "ALTER TABLE clients ADD COLUMN IF NOT EXISTS client_status VARCHAR(50) NOT NULL DEFAULT 'new';",
+        "ALTER TABLE clients ADD COLUMN IF NOT EXISTS visits_count INTEGER NOT NULL DEFAULT 0;",
+        "ALTER TABLE clients ADD COLUMN IF NOT EXISTS is_blacklisted BOOLEAN NOT NULL DEFAULT FALSE;",
+        "ALTER TABLE clients ADD COLUMN IF NOT EXISTS blacklist_reason TEXT;",
+
+        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS service_name VARCHAR(255);",
+        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS price INTEGER;",
+        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS client_name VARCHAR(255);",
+        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS client_contact VARCHAR(255);",
+        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS preferred_contact_method VARCHAR(50);",
+        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS client_status_snapshot VARCHAR(50);",
+    ]
+
+    db = SessionLocal()
+    try:
+        for command in sql_commands:
+            db.execute(text(command))
+        db.commit()
+
+        return {
+            "status": "success",
+            "message": "Database migration completed",
+        }
+    except Exception as e:
+        db.rollback()
+        logger.exception("Database migration failed")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
