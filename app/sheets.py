@@ -58,7 +58,26 @@ def _get_service():
 
 
 def _normalize_contact(contact: str):
-    return (contact or "").strip().lower().replace(" ", "")
+    if not contact:
+        return ""
+
+    normalized = str(contact).strip().lower()
+
+    normalized = normalized.replace(" ", "")
+    normalized = normalized.replace("-", "")
+    normalized = normalized.replace("(", "")
+    normalized = normalized.replace(")", "")
+
+    if normalized.startswith("+7"):
+        normalized = "7" + normalized[2:]
+
+    if normalized.startswith("8") and len(normalized) >= 11:
+        normalized = "7" + normalized[1:]
+
+    if normalized.startswith("@"):
+        normalized = normalized[1:]
+
+    return normalized
 
 
 def _booking_status_ru(value: str):
