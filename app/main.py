@@ -31,7 +31,13 @@ from app.storage import (
 )
 
 from app.calendar import generate_slots, create_event, delete_event, update_event
-from app.sheets import append_booking_row, update_booking_status, update_booking_row_after_reschedule
+from app.sheets import (
+    append_booking_row,
+    update_booking_status,
+    update_booking_row_after_reschedule,
+    is_contact_blacklisted_in_sheet,
+    is_booking_active_by_sheet,
+)
 
 logger = logging.getLogger("uvicorn.error")
 
