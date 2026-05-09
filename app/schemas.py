@@ -1,4 +1,5 @@
-from typing import Optional, Literal
+from typing import Literal, Optional
+
 from pydantic import BaseModel, Field
 
 
@@ -21,9 +22,9 @@ ClientStatusType = Literal["new", "returned", "regular", "left", "claim", "black
 
 
 class ServiceRecommendationRequest(BaseModel):
-    category: CategoryType = Field(..., description="Что интересует: manicure / pedicure / combo")
-    care_needed: YesNoType = Field(..., description="Нужен ли дополнительный уход: yes / no")
-    coating_type: CoatingType = Field(..., description="Тип покрытия: none / lacquer / gel / films")
+    category: CategoryType
+    care_needed: YesNoType
+    coating_type: CoatingType
 
 
 class ServiceRecommendationResponse(BaseModel):
@@ -33,33 +34,36 @@ class ServiceRecommendationResponse(BaseModel):
 
 
 class ContactRequestCreate(BaseModel):
-    name: str = Field(..., description="Имя и фамилия или псевдоним")
-    contact: str = Field(..., description="Телефон или Telegram username")
-    preferred_contact_method: ContactMethodType = Field(..., description="telegram / phone")
-    comment: Optional[str] = Field(default=None, description="Комментарий")
+    name: str
+    contact: str
+    preferred_contact_method: ContactMethodType
+    comment: Optional[str] = None
 
 
 class BookingLeadCreate(BaseModel):
-    name: str = Field(..., description="Имя и фамилия или псевдоним")
-    contact: str = Field(..., description="Телефон или Telegram username")
-    preferred_contact_method: Optional[ContactMethodType] = Field(default=None, description="telegram / phone")
-    service_id: str = Field(..., description="ID услуги")
-    preferred_date: str = Field(..., description="Дата YYYY-MM-DD")
-    preferred_time: str = Field(..., description="Время HH:MM")
-    comment: Optional[str] = Field(default=None, description="Комментарий")
+    name: str
+    contact: str
+    preferred_contact_method: Optional[ContactMethodType] = None
+
+    service_id: Optional[str] = None
+    service_ids: Optional[list[str]] = None
+
+    preferred_date: str
+    preferred_time: str
+    comment: Optional[str] = None
 
 
 class FindBookingRequest(BaseModel):
-    name: str = Field(..., description="Имя")
-    contact: str = Field(..., description="Контакт")
+    name: str
+    contact: str
 
 
 class CancelBookingRequest(BaseModel):
-    booking_id: str = Field(..., description="ID записи")
-    reason: Optional[str] = Field(default=None, description="Причина отмены")
+    booking_id: str
+    reason: Optional[str] = None
 
 
 class RescheduleBookingRequest(BaseModel):
-    booking_id: str = Field(..., description="ID записи")
-    new_date: str = Field(..., description="Новая дата YYYY-MM-DD")
-    new_time: str = Field(..., description="Новое время HH:MM")
+    booking_id: str
+    new_date: str
+    new_time: str
