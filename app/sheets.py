@@ -56,50 +56,45 @@ def _client_status_ru(value: str):
 
 
 def _normalize_row(row: list):
-    """
-    Колонки:
-    A Booking ID
-    B Дата
-    C Время
-    D Имя
-    E Контакт
-    F Услуга
-    G Стоимость
-    H Комментарий
-    I Статус записи
-    J Статус клиента
-    K Способ связи
-    """
-
     result = list(row)
 
     while len(result) < 11:
         result.append("")
 
-    # Дата и время строго текстом, чтобы Google Sheets не превращал время в 0,4791666667
+    result = result[:11]
+
     result[1] = str(result[1] or "")
     result[2] = str(result[2] or "")
-
-    # Статусы на русском
     result[8] = _booking_status_ru(str(result[8] or ""))
     result[9] = _client_status_ru(str(result[9] or ""))
 
     return result
 
 
+def _find_next_empty_row(service):
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{SHEET_NAME}!A2:A",
+    ).execute()
+
+    rows = result.get("values", [])
+
+    return len(rows) + 2
+
+
 def append_booking_row(row: list):
     service = _get_service()
     normalized_row = _normalize_row(row)
+    next_row = _find_next_empty_row(service)
 
-result = service.spreadsheets().values().append(
-    spreadsheetId=SPREADSHEET_ID,
-    range=f"{SHEET_NAME}!A2:K",
-    valueInputOption="RAW",
-    insertDataOption="OVERWRITE",
-    body={"values": [normalized_row]},
-).execute()
+    result = service.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{SHEET_NAME}!A{next_row}:K{next_row}",
+        valueInputOption="RAW",
+        body={"values": [normalized_row]},
+    ).execute()
 
-    logger.info("Google Sheets row appended: %s", result)
+    logger.info("Google Sheets row written to row %s: %s", next_row, result)
     return result
 
 
@@ -108,7 +103,7 @@ def update_booking_status(booking_id: str, new_status: str):
 
     result = service.spreadsheets().values().get(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"{SHEET_NAME}!A2:Z",
+        range=f"{SHEET_NAME}!A2:K",
     ).execute()
 
     rows = result.get("values", [])
@@ -141,7 +136,7 @@ def update_booking_row_after_reschedule(
 
     result = service.spreadsheets().values().get(
         spreadsheetId=SPREADSHEET_ID,
-        range=f"{SHEET_NAME}!A2:Z",
+        range=f"{SHEET_NAME}!A2:K",
     ).execute()
 
     rows = result.get("values", [])
