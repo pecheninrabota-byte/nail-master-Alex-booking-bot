@@ -14,9 +14,12 @@ SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Лист1")
 
 
 BOOKING_STATUS_RU = {
-    "confirmed": "Подтверждена",
+    "confirmed": "Ожидает подтверждения",
+    "waiting_confirmation": "Ожидает подтверждения",
     "cancelled": "Отменена",
     "rescheduled": "Перенесена",
+    "completed": "Завершена",
+    "no_show": "Не пришёл",
     "debug": "Тест",
 }
 
@@ -27,6 +30,13 @@ CLIENT_STATUS_RU = {
     "left": "Ушёл",
     "claim": "Рекламация",
     "blacklist": "Чёрный список",
+}
+
+
+CLOSED_BOOKING_STATUSES_RU = {
+    "Отменена",
+    "Завершена",
+    "Не пришёл",
 }
 
 
@@ -45,6 +55,10 @@ def _get_service():
     )
 
     return build("sheets", "v4", credentials=creds)
+
+
+def _normalize_contact(contact: str):
+    return (contact or "").strip().lower().replace(" ", "")
 
 
 def _booking_status_ru(value: str):
@@ -167,3 +181,60 @@ def update_booking_row_after_reschedule(
 
     logger.warning("Google Sheets booking_id not found for reschedule: %s", booking_id)
     return False
+
+
+def get_manual_client_status_by_contact(contact: str):
+    service = _get_service()
+    normalized_contact = _normalize_contact(contact)
+
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{SHEET_NAME}!A2:K",
+    ).execute()
+
+    rows = result.get("values", [])
+
+    # Идём снизу вверх, чтобы брать самый свежий статус клиента
+    for row in reversed(rows):
+        if len(row) >= 10:
+            row_contact = _normalize_contact(row[4])
+            client_status = row[9]
+
+            if row_contact == normalized_contact:
+                return client_status
+
+    return None
+
+
+def is_contact_blacklisted_in_sheet(contact: str):
+    status = get_manual_client_status_by_contact(contact)
+    return status == "Чёрный список"
+
+
+def get_manual_booking_status_by_id(booking_id: str):
+    service = _get_service()
+
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{SHEET_NAME}!A2:K",
+    ).execute()
+
+    rows = result.get("values", [])
+
+    for row in rows:
+        if row and row[0] == booking_id:
+            if len(row) >= 9:
+                return row[8]
+            return None
+
+    return None
+
+
+def is_booking_active_by_sheet(booking_id: str):
+    status = get_manual_booking_status_by_id(booking_id)
+
+    # Если строки в Sheets нет, не блокируем — ориентируемся на Postgres
+    if not status:
+        return True
+
+    return status not in CLOSED_BOOKING_STATUSES_RU
