@@ -71,3 +71,46 @@ def update_booking_status(booking_id: str, new_status: str):
 
     logger.warning("Google Sheets booking_id not found: %s", booking_id)
     return False
+
+
+def update_booking_row_after_reschedule(
+    booking_id: str,
+    new_date: str,
+    new_time: str,
+    new_status: str = "rescheduled",
+):
+    service = _get_service()
+
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{SHEET_NAME}!A2:Z",
+    ).execute()
+
+    rows = result.get("values", [])
+
+    for i, row in enumerate(rows):
+        if row and row[0] == booking_id:
+            row_index = i + 2
+
+            service.spreadsheets().values().batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body={
+                    "valueInputOption": "USER_ENTERED",
+                    "data": [
+                        {
+                            "range": f"{SHEET_NAME}!B{row_index}:C{row_index}",
+                            "values": [[new_date, new_time]],
+                        },
+                        {
+                            "range": f"{SHEET_NAME}!I{row_index}",
+                            "values": [[new_status]],
+                        },
+                    ],
+                },
+            ).execute()
+
+            logger.info("Google Sheets booking rescheduled: %s", booking_id)
+            return True
+
+    logger.warning("Google Sheets booking_id not found for reschedule: %s", booking_id)
+    return False
