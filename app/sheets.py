@@ -91,13 +91,13 @@ def append_booking_row(row: list):
     service = _get_service()
     normalized_row = _normalize_row(row)
 
-    result = service.spreadsheets().values().append(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{SHEET_NAME}!A1",
-        valueInputOption="RAW",
-        insertDataOption="INSERT_ROWS",
-        body={"values": [normalized_row]},
-    ).execute()
+result = service.spreadsheets().values().append(
+    spreadsheetId=SPREADSHEET_ID,
+    range=f"{SHEET_NAME}!A2:K",
+    valueInputOption="RAW",
+    insertDataOption="OVERWRITE",
+    body={"values": [normalized_row]},
+).execute()
 
     logger.info("Google Sheets row appended: %s", result)
     return result
