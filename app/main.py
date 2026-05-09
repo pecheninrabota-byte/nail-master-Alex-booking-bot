@@ -20,15 +20,14 @@ from app.storage import (
     cancel_booking,
     create_booking,
     create_lead,
+    find_booking_by_id,
     get_client_active_bookings,
     get_or_create_client,
-    find_booking_by_id,
     is_client_blacklisted,
     remove_client_blacklist,
     reschedule_booking,
     set_client_blacklist,
 )
-
 from app.calendar import generate_slots, create_event, delete_event, update_event
 from app.sheets import (
     append_booking_row,
@@ -270,22 +269,24 @@ def contact_request(data: ContactRequestCreate):
     return {"status": "success", "message": "Contact request created"}
 
 
-sheet_blacklisted = safe_sheet_blacklist_check(data.contact)
+@app.post("/booking-lead")
+def booking_lead(data: BookingLeadCreate):
+    sheet_blacklisted = safe_sheet_blacklist_check(data.contact)
 
-if sheet_blacklisted:
-    try:
-        set_client_blacklist(
-            contact=data.contact,
-            reason="Marked as blacklist in Google Sheets",
+    if sheet_blacklisted:
+        try:
+            set_client_blacklist(
+                contact=data.contact,
+                reason="Marked as blacklist in Google Sheets",
+            )
+        except Exception as e:
+            logger.exception("Failed to sync blacklist from Google Sheets to Postgres: %s", e)
+
+    if is_client_blacklisted(data.contact) or sheet_blacklisted:
+        raise HTTPException(
+            status_code=403,
+            detail="Booking is not available for this client. Please contact the master directly.",
         )
-    except Exception as e:
-        logger.exception("Failed to sync blacklist from Google Sheets to Postgres: %s", e)
-
-if is_client_blacklisted(data.contact) or sheet_blacklisted:
-    raise HTTPException(
-        status_code=403,
-        detail="Booking is not available for this client. Please contact the master directly.",
-    )
 
     service_ids = normalize_service_ids(data)
     service = build_booking_service(service_ids)
