@@ -1,214 +1,296 @@
 import logging
+from datetime import datetime
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-
 from sqlalchemy import text
 
-from app.db import Base, engine, SessionLocal
-from app.services import SERVICES, FAQ, get_service
-from app.calendar import generate_slots, create_event, delete_event, update_event
 from app.config import BUFFER_MINUTES
-from app.logic import (
-    recommend_services,
-    build_booking_success_message,
-    get_total_duration_with_buffer,
-)
+from app.db import Base, engine
+from app.models import Booking, Client
 from app.schemas import (
-    ServiceRecommendationRequest,
-    ServiceRecommendationResponse,
-    ContactRequestCreate,
     BookingLeadCreate,
-    FindBookingRequest,
     CancelBookingRequest,
+    ContactRequestCreate,
+    FindBookingRequest,
     RescheduleBookingRequest,
+    ServiceRecommendationRequest,
 )
+from app.services import SERVICES, build_combined_service, get_service
 from app.storage import (
-    get_or_create_client,
-    create_lead,
-    create_booking,
-    find_booking_by_id,
     cancel_booking,
-    reschedule_booking,
-    get_client_by_id,
+    create_booking,
+    create_lead,
     get_client_active_bookings,
+    get_or_create_client,
+    find_booking_by_id,
     is_client_blacklisted,
+    remove_client_blacklist,
+    reschedule_booking,
+    set_client_blacklist,
 )
-from app.telegram import (
-    send_telegram_message,
-    format_booking_created_message,
-    format_booking_cancelled_message,
-    format_booking_rescheduled_message,
-    format_contact_request_message,
-)
-from app.sheets import (
-    append_booking_row,
-    update_booking_status,
-)
+
+from app.calendar import generate_slots, create_event, delete_event, update_event
+from app.sheets import append_booking_row, update_booking_status, update_booking_row_after_reschedule
 
 logger = logging.getLogger("uvicorn.error")
 
-app = FastAPI(title="Nail Master Booking Bot")
-
-if engine is not None:
-    Base.metadata.create_all(bind=engine)
+app = FastAPI(title="Alex Booking Backend")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-def ensure_slot_is_available(service_id: str, date: str, slot_time: str):
-    service = get_service(service_id)
+FAQ = [
+    {
+        "question": "Сколько держится покрытие?",
+        "answer": "Обычно покрытие держится 2–4 недели. Точный срок зависит от состояния ногтей и ухода после процедуры.",
+    },
+    {
+        "question": "Можно ли записаться на несколько услуг сразу?",
+        "answer": "Да, можно выбрать несколько услуг. Система посчитает общую длительность и стоимость.",
+    },
+    {
+        "question": "Как отменить или перенести запись?",
+        "answer": "Через бот на сайте: выберите перенос или отмену записи и укажите контакт, который использовали при записи.",
+    },
+]
 
-    if not service:
-        raise HTTPException(status_code=404, detail="Service not found")
 
-    available_slots = generate_slots(date, service["duration"])
+def normalize_service_ids(data: BookingLeadCreate) -> list[str]:
+    if data.service_ids and len(data.service_ids) > 0:
+        return data.service_ids
 
-    if slot_time not in available_slots:
-        raise HTTPException(
-            status_code=409,
-            detail="Selected time is no longer available. Please choose another slot.",
-        )
+    if data.service_id:
+        return [data.service_id]
 
-    return service, available_slots
+    raise HTTPException(status_code=400, detail="service_id or service_ids is required")
+
+
+def normalize_service_ids_from_query(
+    service_id: str | None = None,
+    service_ids: str | None = None,
+) -> list[str]:
+    if service_ids:
+        ids = [item.strip() for item in service_ids.split(",") if item.strip()]
+        if ids:
+            return ids
+
+    if service_id:
+        return [service_id]
+
+    raise HTTPException(status_code=400, detail="service_id or service_ids is required")
+
+
+def build_booking_service(service_ids: list[str]) -> dict:
+    try:
+        return build_combined_service(service_ids)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+def booking_to_dict(booking):
+    return {
+        "booking_id": booking.id,
+        "service_id": booking.service_id,
+        "service_ids": booking.service_id.split("+") if booking.service_id else [],
+        "service_name": booking.service_name,
+        "price": booking.price,
+        "date": booking.date,
+        "time": booking.time,
+        "duration_minutes": booking.duration_minutes,
+        "buffer_minutes": booking.buffer_minutes,
+        "status": booking.status,
+        "comment": booking.comment,
+        "client_name": booking.client_name,
+        "contact": booking.client_contact,
+        "preferred_contact_method": booking.preferred_contact_method,
+        "client_status_snapshot": booking.client_status_snapshot,
+        "google_calendar_event_id": booking.google_calendar_event_id,
+    }
+
+
+def safe_sheets_append(row: list):
+    try:
+        append_booking_row(row)
+    except Exception as e:
+        logger.exception("Google Sheets append failed: %s", e)
+
+
+def safe_sheets_status(booking_id: str, status: str):
+    try:
+        update_booking_status(booking_id, status)
+    except Exception as e:
+        logger.exception("Google Sheets status update failed: %s", e)
+
+
+def safe_sheets_reschedule(booking_id: str, new_date: str, new_time: str):
+    try:
+        update_booking_row_after_reschedule(booking_id, new_date, new_time, "rescheduled")
+    except Exception as e:
+        logger.exception("Google Sheets reschedule update failed: %s", e)
+
+
+def send_telegram_safely(message: str):
+    try:
+        from app.telegram import send_telegram_message
+
+        send_telegram_message(message)
+    except Exception as e:
+        logger.exception("Telegram send failed: %s", e)
 
 
 @app.get("/")
 def root():
-    return {
-        "status": "ok",
-        "message": "Nail Master Booking API is running",
-    }
+    return {"status": "ok", "message": "Alex Booking Backend is running"}
 
 
 @app.get("/services")
 def get_services():
-    return SERVICES
+    return {"services": SERVICES}
 
 
 @app.get("/faq")
 def get_faq():
-    return FAQ
+    return {"faq": FAQ}
 
 
 @app.get("/slots")
-def get_slots(service_id: str, date: str):
-    service = get_service(service_id)
-
-    if not service:
-        raise HTTPException(status_code=404, detail="Service not found")
+def get_slots(
+    service_id: str | None = Query(default=None),
+    service_ids: str | None = Query(default=None),
+    date: str = Query(...),
+):
+    ids = normalize_service_ids_from_query(service_id=service_id, service_ids=service_ids)
+    service = build_booking_service(ids)
 
     slots = generate_slots(date, service["duration"])
 
     return {
-        "service_id": service_id,
-        "service_name": service["name"],
+        "status": "success",
+        "service": service,
+        "service_id": service["id"],
+        "service_ids": service["ids"],
         "date": date,
         "duration_minutes": service["duration"],
         "buffer_minutes": BUFFER_MINUTES,
-        "total_time_block_minutes": get_total_duration_with_buffer(service, BUFFER_MINUTES),
         "slots": slots,
     }
 
 
-@app.post("/service-recommendation", response_model=ServiceRecommendationResponse)
+@app.post("/service-recommendation")
 def service_recommendation(data: ServiceRecommendationRequest):
-    recommended_services, explanation = recommend_services(
-        category=data.category,
-        care_needed=data.care_needed,
-        coating_type=data.coating_type,
-    )
+    recommended = []
 
-    recommended_ids = [service["id"] for service in recommended_services]
+    if data.category == "combo":
+        recommended = [
+            get_service("combo_file_manicure_pedicure_spa"),
+            get_service("combo_file_manicure_pedicure_films"),
+        ]
+    elif data.category == "manicure":
+        if data.coating_type == "films":
+            recommended = [get_service("file_manicure_films")]
+        elif data.coating_type == "gel":
+            recommended = [get_service("file_manicure_gel_lacquer")]
+        elif data.coating_type == "lacquer":
+            recommended = [get_service("file_manicure_lacquer")]
+        elif data.care_needed == "yes":
+            recommended = [get_service("file_manicure_spa")]
+        else:
+            recommended = [get_service("file_manicure")]
+    elif data.category == "pedicure":
+        if data.coating_type == "films":
+            recommended = [get_service("file_pedicure_films")]
+        elif data.coating_type == "lacquer":
+            recommended = [get_service("file_pedicure_lacquer")]
+        elif data.care_needed == "yes":
+            recommended = [get_service("file_pedicure_spa")]
+        else:
+            recommended = [get_service("file_pedicure")]
+
+    recommended = [item for item in recommended if item]
 
     return {
-        "recommended_services": recommended_services,
-        "explanation": explanation,
-        "recommended_ids": recommended_ids,
+        "recommended_services": recommended,
+        "recommended_ids": [item["id"] for item in recommended],
+        "explanation": "Подобрал услуги по вашим ответам. Можно выбрать одну или несколько услуг для записи.",
     }
 
 
 @app.post("/contact-request")
-def create_contact_request(data: ContactRequestCreate):
-    preferred_contact_method = getattr(data, "preferred_contact_method", None)
-
+def contact_request(data: ContactRequestCreate):
     client = get_or_create_client(
         name=data.name,
         contact=data.contact,
-        preferred_contact_method=preferred_contact_method,
+        preferred_contact_method=data.preferred_contact_method,
     )
 
-    lead = create_lead(
+    create_lead(
         client_id=client.id,
         lead_type="contact_request",
         status="contact_request",
         comment=data.comment,
     )
 
-    telegram_result = send_telegram_message(
-        format_contact_request_message(
-            client_name=data.name,
-            contact=data.contact,
-            preferred_contact_method=preferred_contact_method,
-            comment=data.comment,
-        )
+    message = (
+        "💬 Новая заявка на связь\n\n"
+        f"Имя: {data.name}\n"
+        f"Контакт: {data.contact}\n"
+        f"Способ связи: {data.preferred_contact_method}\n"
+        f"Комментарий: {data.comment or '—'}"
     )
-    logger.info("Contact request telegram result: %s", telegram_result)
+    send_telegram_safely(message)
 
-    return {
-        "status": "success",
-        "message": "Спасибо! Александр свяжется с вами в течение суток удобным для вас способом.",
-        "client_id": client.id,
-        "lead_id": lead.id if lead else None,
-    }
+    return {"status": "success", "message": "Contact request created"}
 
 
 @app.post("/booking-lead")
-def create_booking_lead(data: BookingLeadCreate):
-    service, _ = ensure_slot_is_available(
-        service_id=data.service_id,
-        date=data.preferred_date,
-        slot_time=data.preferred_time,
-    )
-
+def booking_lead(data: BookingLeadCreate):
     if is_client_blacklisted(data.contact):
         raise HTTPException(
             status_code=403,
             detail="Booking is not available for this client. Please contact the master directly.",
         )
 
-    preferred_contact_method = getattr(data, "preferred_contact_method", None)
+    service_ids = normalize_service_ids(data)
+    service = build_booking_service(service_ids)
+
+    slots = generate_slots(data.preferred_date, service["duration"])
+    if data.preferred_time not in slots:
+        raise HTTPException(
+            status_code=400,
+            detail="Selected time slot is not available",
+        )
 
     client = get_or_create_client(
         name=data.name,
         contact=data.contact,
-        preferred_contact_method=preferred_contact_method,
+        preferred_contact_method=data.preferred_contact_method,
     )
 
-    lead = create_lead(
+    create_lead(
         client_id=client.id,
         lead_type="booking_started",
         status="booking_started",
-        comment=data.comment,
-        service_id=data.service_id,
+        service_id=service["id"],
         preferred_date=data.preferred_date,
         preferred_time=data.preferred_time,
+        comment=data.comment,
     )
 
     event_id = create_event(
-        name=client.name,
-        contact=client.contact,
+        name=data.name,
+        contact=data.contact,
         service_name=service["name"],
         date=data.preferred_date,
         time=data.preferred_time,
         duration=service["duration"],
-        preferred_contact_method=getattr(client, "preferred_contact_method", None),
+        preferred_contact_method=data.preferred_contact_method,
         comment=data.comment,
         action_label="Новая запись",
     )
@@ -223,136 +305,80 @@ def create_booking_lead(data: BookingLeadCreate):
         client=client,
     )
 
-    try:
-        append_booking_row([
-            booking.id,
-            booking.date,
-            booking.time,
-            booking.client_name or client.name,
-            booking.client_contact or client.contact,
-            booking.service_name or service["name"],
-            booking.price or service.get("price"),
-            booking.comment or "",
-            booking.status,
-            booking.client_status_snapshot or "",
-            booking.preferred_contact_method or getattr(client, "preferred_contact_method", None) or "",
-        ])
-        logger.info("Booking appended to Google Sheets: %s", booking.id)
-    except Exception:
-        logger.exception("Failed to append booking to Google Sheets")
-
     create_lead(
         client_id=client.id,
         lead_type="booking_confirmed",
         status="booking_confirmed",
-        comment=data.comment,
-        service_id=data.service_id,
+        service_id=service["id"],
         preferred_date=data.preferred_date,
         preferred_time=data.preferred_time,
+        comment=data.comment,
     )
 
-    telegram_result = send_telegram_message(
-        format_booking_created_message(
-            client_name=client.name,
-            contact=client.contact,
-            service_name=service["name"],
-            date=data.preferred_date,
-            time=data.preferred_time,
-            price=service.get("price"),
-            preferred_contact_method=getattr(client, "preferred_contact_method", None),
-            comment=data.comment,
-        )
+    safe_sheets_append(
+        [
+            booking.id,
+            booking.date,
+            booking.time,
+            booking.client_name,
+            booking.client_contact,
+            booking.service_name,
+            booking.price,
+            booking.comment or "",
+            booking.status,
+            booking.client_status_snapshot or "",
+            booking.preferred_contact_method or "",
+        ]
     )
-    logger.info("Booking telegram result: %s", telegram_result)
+
+    message = (
+        "🟢 Новая запись\n\n"
+        f"ID: {booking.id}\n"
+        f"Имя: {booking.client_name}\n"
+        f"Контакт: {booking.client_contact}\n"
+        f"Способ связи: {booking.preferred_contact_method or '—'}\n"
+        f"Услуга: {booking.service_name}\n"
+        f"Стоимость: {booking.price} ₽\n"
+        f"Дата: {booking.date}\n"
+        f"Время: {booking.time}\n"
+        f"Длительность: {booking.duration_minutes} мин\n"
+        f"Комментарий: {booking.comment or '—'}"
+    )
+    send_telegram_safely(message)
 
     return {
         "status": "success",
-        "message": build_booking_success_message(),
-        "booking": {
-            "booking_id": booking.id,
-            "service": booking.service_name or service["name"],
-            "service_id": booking.service_id,
-            "price": booking.price,
-            "date": booking.date,
-            "time": booking.time,
-            "duration_minutes": booking.duration_minutes,
-            "buffer_minutes": booking.buffer_minutes,
-            "client_name": booking.client_name or client.name,
-            "contact": booking.client_contact or client.contact,
-            "preferred_contact_method": booking.preferred_contact_method or getattr(client, "preferred_contact_method", None),
-            "comment": booking.comment,
-            "client_status_snapshot": booking.client_status_snapshot,
-            "google_calendar_event_id": booking.google_calendar_event_id,
-        },
-        "lead_id": lead.id if lead else None,
+        "booking": booking_to_dict(booking),
     }
 
 
 @app.post("/find-booking")
-def api_find_booking(data: FindBookingRequest):
-    bookings = get_client_active_bookings(
-        name=data.name,
-        contact=data.contact,
-    )
-
-    if not bookings:
-        raise HTTPException(status_code=404, detail="Active bookings not found")
-
-    result = []
-    for booking in bookings:
-        service = get_service(booking.service_id)
-
-        result.append({
-            "booking_id": booking.id,
-            "service_id": booking.service_id,
-            "service_name": booking.service_name or (service["name"] if service else booking.service_id),
-            "price": booking.price,
-            "date": booking.date,
-            "time": booking.time,
-            "status": booking.status,
-            "comment": booking.comment,
-            "contact": booking.client_contact,
-            "client_name": booking.client_name,
-            "preferred_contact_method": booking.preferred_contact_method,
-            "google_calendar_event_id": booking.google_calendar_event_id,
-            "client_status_snapshot": booking.client_status_snapshot,
-        })
+def find_booking(data: FindBookingRequest):
+    bookings = get_client_active_bookings(data.name, data.contact)
 
     return {
         "status": "success",
-        "bookings": result,
-        "count": len(result),
+        "bookings": [booking_to_dict(item) for item in bookings],
+        "count": len(bookings),
     }
 
 
 @app.post("/cancel-booking")
-def api_cancel_booking(data: CancelBookingRequest):
+def cancel_booking_endpoint(data: CancelBookingRequest):
     booking = find_booking_by_id(data.booking_id)
 
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
 
-    client = get_client_by_id(booking.client_id)
-    service = get_service(booking.service_id)
+    updated = cancel_booking(data.booking_id, data.reason)
 
-    updated = cancel_booking(
-        booking_id=data.booking_id,
-        reason=data.reason,
-    )
+    if booking.google_calendar_event_id:
+        try:
+            delete_event(booking.google_calendar_event_id)
+        except Exception as e:
+            logger.exception("Google Calendar delete failed: %s", e)
 
-    if not updated:
-        raise HTTPException(status_code=400, detail="Unable to cancel booking")
-
-    try:
-        update_booking_status(updated.id, "cancelled")
-        logger.info("Booking status updated in Google Sheets: %s", updated.id)
-    except Exception:
-        logger.exception("Failed to update booking status in Google Sheets")
-
-    try:
-        delete_event(booking.google_calendar_event_id)
-    except Exception:
-        logger.exception("Failed to delete Google Calendar event for booking_id=%s", booking.id)
+    safe_sheets_status(data.booking_id, "cancelled")
 
     create_lead(
         client_id=updated.client_id,
@@ -361,91 +387,62 @@ def api_cancel_booking(data: CancelBookingRequest):
         service_id=updated.service_id,
         preferred_date=updated.date,
         preferred_time=updated.time,
+        comment=updated.comment,
         cancel_reason=data.reason,
     )
 
-    telegram_result = send_telegram_message(
-        format_booking_cancelled_message(
-            client_name=client.name if client else (updated.client_name or "Неизвестный клиент"),
-            contact=client.contact if client else (updated.client_contact or "—"),
-            service_name=updated.service_name or (service["name"] if service else updated.service_id),
-            date=updated.date,
-            time=updated.time,
-            preferred_contact_method=(
-                getattr(client, "preferred_contact_method", None)
-                if client
-                else updated.preferred_contact_method
-            ),
-            cancel_reason=data.reason,
-        )
+    message = (
+        "🔴 Отмена записи\n\n"
+        f"ID: {updated.id}\n"
+        f"Имя: {updated.client_name}\n"
+        f"Контакт: {updated.client_contact}\n"
+        f"Услуга: {updated.service_name}\n"
+        f"Дата: {updated.date}\n"
+        f"Время: {updated.time}\n"
+        f"Причина: {data.reason or '—'}"
     )
-    logger.info("Cancel telegram result: %s", telegram_result)
+    send_telegram_safely(message)
 
     return {
         "status": "success",
-        "message": "Запись отменена. Буду рад помочь с новой записью позже.",
-        "booking_id": updated.id,
-        "cancel_reason": data.reason,
+        "booking": booking_to_dict(updated),
     }
 
 
 @app.post("/reschedule-booking")
-def api_reschedule_booking(data: RescheduleBookingRequest):
+def reschedule_booking_endpoint(data: RescheduleBookingRequest):
     booking = find_booking_by_id(data.booking_id)
 
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
 
-    service = get_service(booking.service_id)
-
-    if not service:
-        raise HTTPException(status_code=404, detail="Service not found")
-
-    ensure_slot_is_available(
-        service_id=booking.service_id,
-        date=data.new_date,
-        slot_time=data.new_time,
-    )
-
-    client = get_client_by_id(booking.client_id)
-
-    old_date = booking.date
-    old_time = booking.time
-
-    updated = reschedule_booking(
-        booking_id=data.booking_id,
-        new_date=data.new_date,
-        new_time=data.new_time,
-    )
-
-    if not updated:
-        raise HTTPException(status_code=400, detail="Unable to reschedule booking")
-
-    try:
-        update_booking_status(updated.id, "rescheduled")
-        logger.info("Booking status updated in Google Sheets after reschedule: %s", updated.id)
-    except Exception:
-        logger.exception("Failed to update booking status in Google Sheets after reschedule")
-
-    try:
-        update_event(
-            event_id=booking.google_calendar_event_id,
-            date=data.new_date,
-            time=data.new_time,
-            duration=service["duration"],
-            name=client.name if client else updated.client_name,
-            contact=client.contact if client else updated.client_contact,
-            service_name=updated.service_name or service["name"],
-            preferred_contact_method=(
-                getattr(client, "preferred_contact_method", None)
-                if client
-                else updated.preferred_contact_method
-            ),
-            comment=updated.comment,
-            action_label="Перенос записи",
+    slots = generate_slots(data.new_date, booking.duration_minutes)
+    if data.new_time not in slots:
+        raise HTTPException(
+            status_code=400,
+            detail="Selected time slot is not available",
         )
-    except Exception:
-        logger.exception("Failed to update Google Calendar event for booking_id=%s", booking.id)
+
+    if booking.google_calendar_event_id:
+        try:
+            update_event(
+                event_id=booking.google_calendar_event_id,
+                date=data.new_date,
+                time=data.new_time,
+                duration=booking.duration_minutes,
+                name=booking.client_name,
+                contact=booking.client_contact,
+                service_name=booking.service_name,
+                preferred_contact_method=booking.preferred_contact_method,
+                comment=booking.comment,
+                action_label="Перенос записи",
+            )
+        except Exception as e:
+            logger.exception("Google Calendar update failed: %s", e)
+
+    updated = reschedule_booking(data.booking_id, data.new_date, data.new_time)
+
+    safe_sheets_reschedule(data.booking_id, data.new_date, data.new_time)
 
     create_lead(
         client_id=updated.client_id,
@@ -454,82 +451,107 @@ def api_reschedule_booking(data: RescheduleBookingRequest):
         service_id=updated.service_id,
         preferred_date=updated.date,
         preferred_time=updated.time,
+        comment=updated.comment,
     )
 
-    telegram_result = send_telegram_message(
-        format_booking_rescheduled_message(
-            client_name=client.name if client else (updated.client_name or "Неизвестный клиент"),
-            contact=client.contact if client else (updated.client_contact or "—"),
-            service_name=updated.service_name or service["name"],
-            old_date=old_date,
-            old_time=old_time,
-            new_date=updated.date,
-            new_time=updated.time,
-            preferred_contact_method=(
-                getattr(client, "preferred_contact_method", None)
-                if client
-                else updated.preferred_contact_method
-            ),
-            comment=updated.comment,
-        )
+    message = (
+        "🟡 Перенос записи\n\n"
+        f"ID: {updated.id}\n"
+        f"Имя: {updated.client_name}\n"
+        f"Контакт: {updated.client_contact}\n"
+        f"Услуга: {updated.service_name}\n"
+        f"Новая дата: {updated.date}\n"
+        f"Новое время: {updated.time}\n"
+        f"Длительность: {updated.duration_minutes} мин"
     )
-    logger.info("Reschedule telegram result: %s", telegram_result)
+    send_telegram_safely(message)
 
     return {
         "status": "success",
-        "message": "Запись успешно перенесена.",
-        "booking": {
-            "booking_id": updated.id,
-            "service_id": updated.service_id,
-            "service_name": updated.service_name or service["name"],
-            "price": updated.price,
-            "date": updated.date,
-            "time": updated.time,
-            "status": updated.status,
-            "comment": updated.comment,
-            "contact": updated.client_contact or (client.contact if client else None),
-            "client_name": updated.client_name or (client.name if client else None),
-            "preferred_contact_method": updated.preferred_contact_method or (
-                getattr(client, "preferred_contact_method", None) if client else None
-            ),
-            "client_status_snapshot": updated.client_status_snapshot,
-            "google_calendar_event_id": updated.google_calendar_event_id,
-        },
+        "booking": booking_to_dict(updated),
     }
 
 
 @app.get("/debug/migrate-db")
 def debug_migrate_db():
-    if SessionLocal is None:
-        raise HTTPException(status_code=500, detail="DATABASE_URL is not configured")
+    if engine is None:
+        raise HTTPException(status_code=500, detail="DATABASE_URL is missing")
 
-    sql_commands = [
-        "ALTER TABLE clients ADD COLUMN IF NOT EXISTS client_status VARCHAR(50) NOT NULL DEFAULT 'new';",
-        "ALTER TABLE clients ADD COLUMN IF NOT EXISTS visits_count INTEGER NOT NULL DEFAULT 0;",
-        "ALTER TABLE clients ADD COLUMN IF NOT EXISTS is_blacklisted BOOLEAN NOT NULL DEFAULT FALSE;",
-        "ALTER TABLE clients ADD COLUMN IF NOT EXISTS blacklist_reason TEXT;",
+    Base.metadata.create_all(bind=engine)
 
-        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS service_name VARCHAR(255);",
-        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS price INTEGER;",
-        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS client_name VARCHAR(255);",
-        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS client_contact VARCHAR(255);",
-        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS preferred_contact_method VARCHAR(50);",
-        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS client_status_snapshot VARCHAR(50);",
+    statements = [
+        "ALTER TABLE clients ADD COLUMN IF NOT EXISTS client_status VARCHAR DEFAULT 'new' NOT NULL",
+        "ALTER TABLE clients ADD COLUMN IF NOT EXISTS visits_count INTEGER DEFAULT 0 NOT NULL",
+        "ALTER TABLE clients ADD COLUMN IF NOT EXISTS is_blacklisted BOOLEAN DEFAULT FALSE NOT NULL",
+        "ALTER TABLE clients ADD COLUMN IF NOT EXISTS blacklist_reason TEXT",
+        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS service_name VARCHAR",
+        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS price INTEGER",
+        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS client_name VARCHAR",
+        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS client_contact VARCHAR",
+        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS preferred_contact_method VARCHAR",
+        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS client_status_snapshot VARCHAR",
     ]
 
-    db = SessionLocal()
-    try:
-        for command in sql_commands:
-            db.execute(text(command))
-        db.commit()
+    with engine.begin() as conn:
+        for statement in statements:
+            conn.execute(text(statement))
 
-        return {
-            "status": "success",
-            "message": "Database migration completed",
-        }
-    except Exception as e:
-        db.rollback()
-        logger.exception("Database migration failed")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        db.close()
+    return {
+        "status": "success",
+        "message": "Database migration completed",
+    }
+
+
+@app.get("/debug/sheets")
+def debug_sheets():
+    test_id = f"debug-{datetime.utcnow().isoformat()}"
+
+    append_booking_row(
+        [
+            test_id,
+            "2026-01-01",
+            "10:00",
+            "Тестовый клиент",
+            "@test",
+            "Тестовая услуга",
+            1000,
+            "Тестовая строка из /debug/sheets",
+            "debug",
+            "new",
+            "telegram",
+        ]
+    )
+
+    return {
+        "status": "success",
+        "message": "Test row added to Google Sheets",
+        "booking_id": test_id,
+    }
+
+
+@app.post("/debug/blacklist/add")
+def debug_blacklist_add(contact: str, reason: str | None = None):
+    client = set_client_blacklist(contact=contact, reason=reason)
+
+    return {
+        "status": "success",
+        "client_id": client.id,
+        "contact": client.contact,
+        "is_blacklisted": client.is_blacklisted,
+        "reason": client.blacklist_reason,
+    }
+
+
+@app.post("/debug/blacklist/remove")
+def debug_blacklist_remove(contact: str):
+    client = remove_client_blacklist(contact=contact)
+
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    return {
+        "status": "success",
+        "client_id": client.id,
+        "contact": client.contact,
+        "is_blacklisted": client.is_blacklisted,
+    }
