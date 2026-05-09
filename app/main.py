@@ -7,7 +7,6 @@ from sqlalchemy import text
 
 from app.config import BUFFER_MINUTES
 from app.db import Base, engine
-from app.models import Booking, Client
 from app.schemas import (
     BookingLeadCreate,
     CancelBookingRequest,
@@ -142,6 +141,22 @@ def safe_sheets_reschedule(booking_id: str, new_date: str, new_time: str):
         logger.exception("Google Sheets reschedule update failed: %s", e)
 
 
+def safe_sheet_blacklist_check(contact: str) -> bool:
+    try:
+        return is_contact_blacklisted_in_sheet(contact)
+    except Exception as e:
+        logger.exception("Google Sheets blacklist check failed: %s", e)
+        return False
+
+
+def safe_sheet_booking_active_check(booking_id: str) -> bool:
+    try:
+        return is_booking_active_by_sheet(booking_id)
+    except Exception as e:
+        logger.exception("Google Sheets booking active check failed: %s", e)
+        return True
+
+
 def send_telegram_safely(message: str):
     try:
         from app.telegram import send_telegram_message
@@ -257,7 +272,7 @@ def contact_request(data: ContactRequestCreate):
 
 @app.post("/booking-lead")
 def booking_lead(data: BookingLeadCreate):
-    if is_client_blacklisted(data.contact):
+    if is_client_blacklisted(data.contact) or safe_sheet_blacklist_check(data.contact):
         raise HTTPException(
             status_code=403,
             detail="Booking is not available for this client. Please contact the master directly.",
@@ -331,7 +346,7 @@ def booking_lead(data: BookingLeadCreate):
             booking.service_name,
             booking.price,
             booking.comment or "",
-            booking.status,
+            "waiting_confirmation",
             booking.client_status_snapshot or "",
             booking.preferred_contact_method or "",
         ]
@@ -348,6 +363,7 @@ def booking_lead(data: BookingLeadCreate):
         f"Дата: {booking.date}\n"
         f"Время: {booking.time}\n"
         f"Длительность: {booking.duration_minutes} мин\n"
+        f"Статус записи: Ожидает подтверждения\n"
         f"Комментарий: {booking.comment or '—'}"
     )
     send_telegram_safely(message)
@@ -362,6 +378,11 @@ def booking_lead(data: BookingLeadCreate):
 def find_booking(data: FindBookingRequest):
     bookings = get_client_active_bookings(data.name, data.contact)
 
+    bookings = [
+        booking for booking in bookings
+        if safe_sheet_booking_active_check(booking.id)
+    ]
+
     return {
         "status": "success",
         "bookings": [booking_to_dict(item) for item in bookings],
@@ -375,6 +396,12 @@ def cancel_booking_endpoint(data: CancelBookingRequest):
 
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
+
+    if not safe_sheet_booking_active_check(booking.id):
+        raise HTTPException(
+            status_code=400,
+            detail="This booking is already closed in CRM",
+        )
 
     updated = cancel_booking(data.booking_id, data.reason)
 
@@ -421,6 +448,12 @@ def reschedule_booking_endpoint(data: RescheduleBookingRequest):
 
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
+
+    if not safe_sheet_booking_active_check(booking.id):
+        raise HTTPException(
+            status_code=400,
+            detail="This booking is already closed in CRM",
+        )
 
     slots = generate_slots(data.new_date, booking.duration_minutes)
     if data.new_time not in slots:
