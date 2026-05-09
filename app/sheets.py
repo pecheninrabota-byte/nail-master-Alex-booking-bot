@@ -226,8 +226,25 @@ def get_manual_client_status_by_contact(contact: str):
 
 
 def is_contact_blacklisted_in_sheet(contact: str):
-    status = get_manual_client_status_by_contact(contact)
-    return status == "Чёрный список"
+    service = _get_service()
+    normalized_contact = _normalize_contact(contact)
+
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{SHEET_NAME}!A2:K",
+    ).execute()
+
+    rows = result.get("values", [])
+
+    for row in rows:
+        if len(row) >= 10:
+            row_contact = _normalize_contact(row[4])
+            client_status = str(row[9] or "").strip()
+
+            if row_contact == normalized_contact and client_status == "Чёрный список":
+                return True
+
+    return False
 
 
 def get_manual_booking_status_by_id(booking_id: str):
