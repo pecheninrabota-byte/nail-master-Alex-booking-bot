@@ -13,6 +13,23 @@ SPREADSHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Лист1")
 
 
+BOOKING_STATUS_RU = {
+    "confirmed": "Подтверждена",
+    "cancelled": "Отменена",
+    "rescheduled": "Перенесена",
+    "debug": "Тест",
+}
+
+CLIENT_STATUS_RU = {
+    "new": "Новый клиент",
+    "returned": "Повторный клиент",
+    "regular": "Постоянный клиент",
+    "left": "Ушёл",
+    "claim": "Рекламация",
+    "blacklist": "Чёрный список",
+}
+
+
 def _get_service():
     raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
@@ -30,15 +47,56 @@ def _get_service():
     return build("sheets", "v4", credentials=creds)
 
 
+def _booking_status_ru(value: str):
+    return BOOKING_STATUS_RU.get(value, value or "")
+
+
+def _client_status_ru(value: str):
+    return CLIENT_STATUS_RU.get(value, value or "")
+
+
+def _normalize_row(row: list):
+    """
+    Колонки:
+    A Booking ID
+    B Дата
+    C Время
+    D Имя
+    E Контакт
+    F Услуга
+    G Стоимость
+    H Комментарий
+    I Статус записи
+    J Статус клиента
+    K Способ связи
+    """
+
+    result = list(row)
+
+    while len(result) < 11:
+        result.append("")
+
+    # Дата и время строго текстом, чтобы Google Sheets не превращал время в 0,4791666667
+    result[1] = str(result[1] or "")
+    result[2] = str(result[2] or "")
+
+    # Статусы на русском
+    result[8] = _booking_status_ru(str(result[8] or ""))
+    result[9] = _client_status_ru(str(result[9] or ""))
+
+    return result
+
+
 def append_booking_row(row: list):
     service = _get_service()
+    normalized_row = _normalize_row(row)
 
     result = service.spreadsheets().values().append(
         spreadsheetId=SPREADSHEET_ID,
         range=f"{SHEET_NAME}!A1",
-        valueInputOption="USER_ENTERED",
+        valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
-        body={"values": [row]},
+        body={"values": [normalized_row]},
     ).execute()
 
     logger.info("Google Sheets row appended: %s", result)
@@ -62,8 +120,8 @@ def update_booking_status(booking_id: str, new_status: str):
             service.spreadsheets().values().update(
                 spreadsheetId=SPREADSHEET_ID,
                 range=f"{SHEET_NAME}!I{row_index}",
-                valueInputOption="USER_ENTERED",
-                body={"values": [[new_status]]},
+                valueInputOption="RAW",
+                body={"values": [[_booking_status_ru(new_status)]]},
             ).execute()
 
             logger.info("Google Sheets booking status updated: %s -> %s", booking_id, new_status)
@@ -95,15 +153,15 @@ def update_booking_row_after_reschedule(
             service.spreadsheets().values().batchUpdate(
                 spreadsheetId=SPREADSHEET_ID,
                 body={
-                    "valueInputOption": "USER_ENTERED",
+                    "valueInputOption": "RAW",
                     "data": [
                         {
                             "range": f"{SHEET_NAME}!B{row_index}:C{row_index}",
-                            "values": [[new_date, new_time]],
+                            "values": [[str(new_date), str(new_time)]],
                         },
                         {
                             "range": f"{SHEET_NAME}!I{row_index}",
-                            "values": [[new_status]],
+                            "values": [[_booking_status_ru(new_status)]],
                         },
                     ],
                 },
