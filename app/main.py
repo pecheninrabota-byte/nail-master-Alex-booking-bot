@@ -209,7 +209,6 @@ def service_recommendation(data: ServiceRecommendationRequest):
 
     if data.category == "combo":
         recommended = [
-            get_service("combo_file_manicure_pedicure_spa"),
             get_service("combo_file_manicure_pedicure_films"),
         ]
     elif data.category == "manicure":
@@ -219,8 +218,6 @@ def service_recommendation(data: ServiceRecommendationRequest):
             recommended = [get_service("file_manicure_gel_lacquer")]
         elif data.coating_type == "lacquer":
             recommended = [get_service("file_manicure_lacquer")]
-        elif data.care_needed == "yes":
-            recommended = [get_service("file_manicure_spa")]
         else:
             recommended = [get_service("file_manicure")]
     elif data.category == "pedicure":
@@ -228,8 +225,6 @@ def service_recommendation(data: ServiceRecommendationRequest):
             recommended = [get_service("file_pedicure_films")]
         elif data.coating_type == "lacquer":
             recommended = [get_service("file_pedicure_lacquer")]
-        elif data.care_needed == "yes":
-            recommended = [get_service("file_pedicure_spa")]
         else:
             recommended = [get_service("file_pedicure")]
 
